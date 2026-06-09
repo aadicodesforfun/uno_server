@@ -12,9 +12,11 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-const rooms = {};         
-const matchmakeQueue = []; 
+// ── GAME STATE ───────────────────────────────────────────────────────────────
+const rooms = {};          // roomCode → room
+const matchmakeQueue = []; // { socketId, name, joinedAt }
 
+// ── DECK ─────────────────────────────────────────────────────────────────────
 const COLORS   = ['red','blue','green','yellow'];
 const SPECIALS = ['skip','reverse','draw2'];
 const NUMS     = ['0','1','2','3','4','5','6','7','8','9'];
@@ -47,6 +49,7 @@ function shuffle(arr) {
   return a;
 }
 
+// ── HELPERS ──────────────────────────────────────────────────────────────────
 const genCode    = () => Math.random().toString(36).slice(2,8).toUpperCase();
 const isWild     = c  => c.value === 'wild' || c.value === 'wild4';
 const playerName = (room, pid) => room.players.find(p => p.id === pid)?.name ?? 'Unknown';
@@ -77,17 +80,22 @@ function drawCards(room, playerId, count) {
   return drawn;
 }
 
+// ── CAN PLAY ─────────────────────────────────────────────────────────────────
+// When there's a drawStack the next player MUST either stack or accept draws.
+// They cannot play any other card.
 function canPlay(card, topCard, activeColor, drawStack) {
   if (drawStack > 0) {
-    if (card.value === 'draw2'  && drawStack % 4 !== 0) return true; 
-    if (card.value === 'wild4')                         return true; 
-    return false; 
+    // Only stacking cards can be played
+    if (card.value === 'draw2'  && drawStack % 4 !== 0) return true; // stack on +2 stack
+    if (card.value === 'wild4')                         return true; // stack on any draw stack
+    return false; // no other card is valid while stack is pending
   }
   if (isWild(card)) return true;
   const effColor = activeColor || topCard.color;
   return card.color === effColor || card.value === topCard.value;
 }
 
+// ── ADVANCE TURN ─────────────────────────────────────────────────────────────
 function advanceTurn(room, extraSkip = false) {
   const n    = room.players.length;
   let   next = (room.currentPlayer + room.direction + n) % n;
@@ -95,6 +103,7 @@ function advanceTurn(room, extraSkip = false) {
   room.currentPlayer = next;
 }
 
+// Returns whether turn should skip one extra step (skip / reverse-as-skip / draw cards)
 function applyCardEffect(room, card, playerId) {
   let skip = false;
 
@@ -105,15 +114,18 @@ function applyCardEffect(room, card, playerId) {
   } else if (card.value === 'reverse') {
     room.direction *= -1;
     addLog(room, `⇄ ${playerName(room, playerId)} reversed direction`);
-    if (room.players.length === 2) skip = true; 
+    if (room.players.length === 2) skip = true; // acts as skip with 2 players
 
   } else if (card.value === 'draw2') {
+    // Stack onto existing draw stack (only draw2 can stack on draw2)
     room.drawStack += 2;
     addLog(room, `+2 by ${playerName(room, playerId)} — stack is now +${room.drawStack}`);
+    // Turn advances normally; the NEXT player must deal with the stack
 
   } else if (card.value === 'wild4') {
     room.drawStack += 4;
     addLog(room, `+4 by ${playerName(room, playerId)} — stack is now +${room.drawStack}`);
+    // Turn advances normally; the NEXT player must deal with the stack
 
   } else if (card.value === 'wild') {
     addLog(room, `🌈 ${playerName(room, playerId)} chose ${room.activeColor}`);
@@ -122,6 +134,7 @@ function applyCardEffect(room, card, playerId) {
   return skip;
 }
 
+// ── PUBLIC STATE ─────────────────────────────────────────────────────────────
 function publicState(room, forPlayerId) {
   const hands = {};
   for (const pid of Object.keys(room.hands)) {
@@ -153,6 +166,7 @@ function broadcastState(room) {
   }
 }
 
+// ── INIT GAME (shared between create/matchmake) ───────────────────────────
 function initGameState(room) {
   const deck = buildDeck();
   room.hands = {};
@@ -176,14 +190,18 @@ function initGameState(room) {
   room.log           = [`🃏 Game started! First card: ${startCard.color} ${startCard.value}`];
 }
 
+// ── MATCHMAKING ──────────────────────────────────────────────────────────────
+// Try to pair up to 4 queued players
 function tryMatchmake() {
+  // Prune stale / disconnected entries
   for (let i = matchmakeQueue.length - 1; i >= 0; i--) {
     const s = io.sockets.sockets.get(matchmakeQueue[i].socketId);
     if (!s) matchmakeQueue.splice(i, 1);
   }
 
-  if (matchmakeQueue.length < 2) return; 
+  if (matchmakeQueue.length < 2) return; // need at least 2
 
+  // Take 2–4 players (prefer 4 if available, but don't wait — start at 2)
   const batch = matchmakeQueue.splice(0, Math.min(matchmakeQueue.length, 4));
   const code  = genCode();
 
@@ -200,6 +218,7 @@ function tryMatchmake() {
 
   rooms[code] = room;
 
+  // Wire up each socket
   for (const entry of batch) {
     const s = io.sockets.sockets.get(entry.socketId);
     if (!s) continue;
@@ -212,6 +231,7 @@ function tryMatchmake() {
   addLog(room, `🎲 Matched ${batch.length} players! Starting in 3 seconds…`);
   broadcastState(room);
 
+  // Auto-start after 3 s
   setTimeout(() => {
     if (!rooms[code]) return;
     initGameState(rooms[code]);
@@ -222,14 +242,17 @@ function tryMatchmake() {
   console.log(`[matchmake] created room ${code} for: ${batch.map(e=>e.name).join(', ')}`);
 }
 
+// ── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) =>
   res.json({ status: 'UNO server 🃏', rooms: Object.keys(rooms).length, queue: matchmakeQueue.length })
 );
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// ── SOCKET ───────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log(`[connect] ${socket.id}`);
 
+  // ── CREATE ROOM ────────────────────────────────────────────────────────────
   socket.on('createRoom', ({ name }, cb) => {
     const code     = genCode();
     const playerId = socket.id;
@@ -254,6 +277,7 @@ io.on('connection', (socket) => {
     broadcastState(rooms[code]);
   });
 
+  // ── JOIN ROOM ──────────────────────────────────────────────────────────────
   socket.on('joinRoom', ({ code, name }, cb) => {
     const room = rooms[code];
     if (!room)                       return cb({ ok: false, error: 'Room not found' });
@@ -274,7 +298,9 @@ io.on('connection', (socket) => {
     broadcastState(room);
   });
 
+  // ── MATCHMAKE ──────────────────────────────────────────────────────────────
   socket.on('joinMatchmaking', ({ name }, cb) => {
+    // If already in queue, ignore
     if (matchmakeQueue.find(e => e.socketId === socket.id)) {
       return cb && cb({ ok: true, position: matchmakeQueue.length });
     }
@@ -287,6 +313,7 @@ io.on('connection', (socket) => {
 
     cb && cb({ ok: true, position: matchmakeQueue.length });
 
+    // Broadcast queue size to all queued players
     for (const entry of matchmakeQueue) {
       io.to(entry.socketId).emit('queueUpdate', { position: matchmakeQueue.length });
     }
@@ -301,6 +328,7 @@ io.on('connection', (socket) => {
     cb && cb({ ok: true });
   });
 
+  // ── START GAME (host manual start) ────────────────────────────────────────
   socket.on('startGame', (_, cb) => {
     const { roomCode, playerId } = socket.data;
     const room = rooms[roomCode];
@@ -316,6 +344,7 @@ io.on('connection', (socket) => {
     broadcastState(room);
   });
 
+  // ── PLAY CARD ──────────────────────────────────────────────────────────────
   socket.on('playCard', ({ cardId, chosenColor }, cb) => {
     const { roomCode, playerId } = socket.data;
     const room = rooms[roomCode];
@@ -335,13 +364,16 @@ io.on('connection', (socket) => {
       return cb && cb({ ok: false, error: "Can't play that card right now" });
     }
 
+    // Remove from hand, push to discard
     hand.splice(cardIdx, 1);
     room.discard.push(card);
 
+    // Set active color BEFORE applyCardEffect logs it
     if (isWild(card)) {
       room.activeColor = chosenColor || 'red';
     } else {
       room.activeColor = card.color;
+      // Only reset drawStack if card does NOT continue a stack
       if (card.value !== 'draw2' && card.value !== 'wild4') {
         room.drawStack = 0;
       }
@@ -349,6 +381,7 @@ io.on('connection', (socket) => {
 
     addLog(room, `🃏 ${playerName(room, playerId)} played ${card.color} ${card.value}`);
 
+    // UNO penalty check
     if (hand.length === 1 && !room.unoCallers[playerId]) {
       room.unoCallers[playerId] = 'pending';
       setTimeout(() => {
@@ -361,6 +394,7 @@ io.on('connection', (socket) => {
       }, 3000);
     }
 
+    // Win check
     if (hand.length === 0) {
       room.status = 'finished';
       room.winner = playerName(room, playerId);
@@ -370,15 +404,19 @@ io.on('connection', (socket) => {
       return;
     }
 
-
+    // Apply effect (updates drawStack for draw2/wild4, handles skip/reverse)
     const skip = applyCardEffect(room, card, playerId);
 
+    // Advance to next player (skip=true means advance one extra for skip/reverse-2p)
     advanceTurn(room, skip);
 
     cb && cb({ ok: true });
     broadcastState(room);
   });
 
+  // ── DRAW CARD ──────────────────────────────────────────────────────────────
+  // The CURRENT player draws (they are the one being punished by the stack,
+  // or voluntarily drawing). Turn then passes to next player.
   socket.on('drawCard', (_, cb) => {
     const { roomCode, playerId } = socket.data;
     const room = rooms[roomCode];
@@ -387,22 +425,25 @@ io.on('connection', (socket) => {
     const currentPid = room.players[room.currentPlayer].id;
     if (currentPid !== playerId) return cb && cb({ ok: false, error: 'Not your turn' });
 
-
+    // How many cards does this player draw?
     let count = 1;
     if (room.drawStack > 0) {
       count          = room.drawStack;
       room.drawStack = 0;
     }
 
+    // Draw cards go to the CURRENT player (they are the one being forced to draw)
     drawCards(room, playerId, count);
     addLog(room, `📥 ${playerName(room, playerId)} drew ${count} card${count > 1 ? 's' : ''}`);
 
+    // Drawing ends your turn — move to the next player
     advanceTurn(room, false);
 
     cb && cb({ ok: true });
     broadcastState(room);
   });
 
+  // ── CALL UNO ──────────────────────────────────────────────────────────────
   socket.on('callUno', (_, cb) => {
     const { roomCode, playerId } = socket.data;
     const room = rooms[roomCode];
@@ -414,6 +455,7 @@ io.on('connection', (socket) => {
     broadcastState(room);
   });
 
+  // ── RESTART ────────────────────────────────────────────────────────────────
   socket.on('restartGame', (_, cb) => {
     const { roomCode, playerId } = socket.data;
     const room = rooms[roomCode];
@@ -434,6 +476,7 @@ io.on('connection', (socket) => {
     broadcastState(room);
   });
 
+  // ── DISCONNECT ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     // Remove from matchmaking queue if present
     const qi = matchmakeQueue.findIndex(e => e.socketId === socket.id);
@@ -460,11 +503,13 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Transfer host
     if (player.isHost) {
       room.players[0].isHost = true;
       addLog(room, `👑 ${room.players[0].name} is now host`);
     }
 
+    // End game if too few players
     if (room.status === 'playing' && room.players.length < 2) {
       room.status   = 'waiting';
       room.hands    = {};
@@ -481,5 +526,6 @@ io.on('connection', (socket) => {
   });
 });
 
+// ── START ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`✅ UNO server on port ${PORT}`));
